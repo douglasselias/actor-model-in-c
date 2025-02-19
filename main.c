@@ -1,48 +1,53 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+
+typedef int32_t  s32;
+typedef int64_t  s64;
+
+typedef uint8_t  u8;
+typedef uint64_t u64;
 
 typedef struct Actor Actor;
 typedef void compute_t(Actor*, void*);
 
 struct Actor {
-  // These two could be generic data
-  char* mailbox[100];
-  int state;
+  u64 id;
+  volatile s64 total_messages;
+  volatile s64 write_index;
+  u64 read_index;
 
-  int id;
-  int write_index;
-  int read_index;
-  int total_messages;
+  char* mailbox[100];
+  u64 mailbox_capacity;
+  u64 state;
+
   compute_t* compute;
-  HANDLE write_mutex;
 };
 
-int global_actor_id = 0;
+u64 global_actor_id = 0;
 Actor* global_actor_list[100] = {0};
 
-Actor* create_actor(compute_t* compute) {
+Actor* create_actor(u64 mailbox_capacity, compute_t* compute) {
   Actor* actor = calloc(sizeof(Actor), 1);
-  /// How to do with void* ? Maybe I could pass as an argument, like create_actor(compute, sizeof(MyData) * 2 /* size of mailbox, array of two MyData (Mydata is the message type) */, sizeof(MyState));
-  for(int i = 0; i < 100; i++)
+  actor->mailbox_capacity = mailbox_capacity;
+  for(u64 i = 0; i < mailbox_capacity; i++)
     actor->mailbox[i] = calloc(sizeof(char), 50);
   actor->compute = compute;
-  actor->write_mutex = CreateMutex(NULL, false, NULL);
   actor->id = global_actor_id;
   global_actor_list[actor->id] = actor;
   global_actor_id++;
   return actor;
 }
 
-// Platform dependent
 DWORD run_actor(void* args) {
   Actor* actor = (Actor*)args;
   while(true) {
-    while(actor->total_messages > 0 && actor->read_index != actor->write_index) {
+    while(actor->total_messages > 0 && actor->read_index != (u64)actor->write_index) {
       actor->compute(actor, (void*)actor->mailbox[actor->read_index]);
-      actor->read_index = (actor->read_index + 1) % 100;
+      actor->read_index = (actor->read_index + 1) % actor->mailbox_capacity;
       actor->total_messages--;
     }
   }
@@ -51,42 +56,29 @@ DWORD run_actor(void* args) {
 }
 
 void send_message(Actor* actor, char* message) {
-  int wait_result = WaitForSingleObject(actor->write_mutex, 1000);
-
-  switch(wait_result) {
-    case WAIT_OBJECT_0: {
-      strcpy(actor->mailbox[actor->write_index], message);
-      actor->write_index = (actor->write_index + 1) % 100;
-      actor->total_messages++;
-      break;
-    }
-    case WAIT_TIMEOUT: {
-      printf("Failed to send message to actor id %d", actor->id);
-      break;
-    }
-  }
-
-  ReleaseMutex(actor->write_mutex);
+  u64 write_index = InterlockedCompareExchange64(&actor->write_index, (actor->write_index + 1) % actor->mailbox_capacity, actor->write_index);
+  strcpy(actor->mailbox[write_index], message);
+  InterlockedIncrement64(&(actor->total_messages));
 }
 
 /// User defined
 void compute_state_a(Actor* actor, void* message) {
   char* msg = (char*)message;
-  printf("Computing state -> Actor ID: %d MSG: %s\n", actor->id, msg);
+  printf("Computing state -> Actor ID: %lld MSG: %s\n", actor->id, msg);
   actor->state++;
   send_message(global_actor_list[actor->id+1], "Hello next actor");
 }
 
 void compute_state_b(Actor* actor, void* message) {
   char* msg = (char*)message;
-  printf("Computing state -> Actor ID: %d MSG: %s\n", actor->id, msg);
+  printf("Computing state -> Actor ID: %lld MSG: %s\n", actor->id, msg);
   actor->state++;
   send_message(global_actor_list[actor->id-1], "Hello previous actor");
 }
 
 int main() {
-  Actor* tom_cruise = create_actor(&compute_state_a);
-  Actor* jim_carrey = create_actor(&compute_state_b);
+  Actor* tom_cruise = create_actor(100, &compute_state_a);
+  Actor* jim_carrey = create_actor(100, &compute_state_b);
 
   send_message(tom_cruise, "Hello Tom.");
   
